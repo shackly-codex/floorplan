@@ -1,6 +1,7 @@
 // Turn per-file route definitions + mounts into full paths, then match HTTP call literals to them.
 // This is what links a frontend repo to a backend repo when no import connects them.
 import { csRoutePath, csAccess, csAttrNames } from './extract.mjs';
+import { elixirModuleResolver } from './elixir.mjs';
 
 export const routeSegments = (p) => p.split('/').filter(Boolean).map((s) =>
   /^(<[^>]*>|\{[^}]*\}|:\w+|\[\.{0,3}[^\]]*\]|\*{1,2}|\$\{[^}]*\})$/.test(s) || /\$\{|\{[^}]*\}/.test(s) ? '*' : s);
@@ -112,7 +113,7 @@ function mountTarget(f, mount, byPath) {
   return { file: f.path, v: head }; // defined in the same file
 }
 
-export function resolveRoutes(files) {
+export function resolveRoutes(files, resolveElixir = elixirModuleResolver(files)) {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const servesOrMounts = (p) => { const t = byPath.get(p); return !!(t?.routes?.length || t?.mounts?.some((m) => m.var || m.spec)); };
   // mountsTo[file] = [{ from, on, v, prefix, line }]   (v === '*' applies to every route in the file)
@@ -235,6 +236,19 @@ export function resolveRoutes(files) {
     // Test files define throwaway apps and stub servers; their routes aren't part of the system.
     if (!f.routes?.length || isTestFile(f.path)) continue;
     for (const r of f.routes) {
+      if (r.framework === 'phoenix') {
+        const target = resolveElixir(f, r.module);
+        const handler = r.live ? 'mount' : r.action;
+        const fn = target?.module.functions.find((def) => def.exported && def.name === handler);
+        routes.push({
+          ...r, file: target?.file.path || f.path,
+          line: fn?.line || target?.module.line || r.line,
+          defFile: f.path, defLine: r.line,
+          ...(fn ? { handler } : {}),
+          ...(target ? { handlerResolved: true } : {}),
+        });
+        continue;
+      }
       if (r.framework === 'firebase') {
         if (r.method === 'ANY' && wrapsApp(f.path, r.path)) continue;
         // served at its own name, whatever the file's routers are mounted under
@@ -268,7 +282,7 @@ export function resolveRoutes(files) {
     }
   }
   routes.push(...conventionalRoutes(files), ...inheritedRoutes(files));
-  return dedupe(routes, (r) => `${r.file}|${r.method}|${r.path}`);
+  return dedupe(routes, (r) => `${r.framework === 'phoenix' ? r.defFile + '|' + r.defLine + '|' : ''}${r.file}|${r.method}|${r.path}`);
 }
 
 /** Where each ASP.NET Core project mapper (MapOrders(this RouteGroupBuilder g)) is called: `${repo}|${name}` -> calls */

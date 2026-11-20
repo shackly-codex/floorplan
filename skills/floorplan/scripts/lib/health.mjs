@@ -14,6 +14,7 @@ import path from 'node:path';
 import { git, compileGlob, blockComments, blankBlockComments, forwardIndexOf, callArgs } from './common.mjs';
 import { csRoutes, csCors, csStripeEvents, csStripeVerified, csBuildContext, csFinding } from './health-csharp.mjs';
 import { stripPhp, phpBare, phpBrackets, phpBudget, phpParts, phpSplit, phpStr, phpArrayBody, phpNamed, phpPairs } from './extract.mjs';
+import { readArguments, tokenizeElixir } from './elixir.mjs';
 
 export const lineIndex = (src) => {
   const starts = [0];
@@ -231,6 +232,42 @@ function notAnAssignment(m, text, sqlish) {
   return sqlish && !q && /^password$/i.test(name) && /^[A-Za-z_]\w*$/.test(value) && /^\s*:["']/.test(whole.slice(name.length));
 }
 
+const localElixirEnvironment = (file) => {
+  const name = /(?:^|\/)config\/(dev|test)\.exs$/.exec(file)?.[1];
+  return name === 'dev' ? 'development' : name;
+};
+
+// Annotate literal local repo settings with their environment when the connection is identifiable.
+function localPostgresPasswords(src, f) {
+  const lines = new Set();
+  if (f.lang !== 'elixir' || !localElixirEnvironment(f.path)) return lines;
+  const tokens = tokenizeElixir(src);
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.type !== 'word' || token.value !== 'config' || tokens[i - 1]?.line === token.line) continue;
+    const { groups } = readArguments(tokens, i + 1);
+    const repo = groups[1]?.map((part) => part.value).join('') || '';
+    if (groups[0]?.length !== 1 || groups[0][0].type !== 'atom' || !/^(?:[A-Z]\w*\.)*(?:[A-Z]\w*)?Repo$/.test(repo)) continue;
+    const options = groups[2]?.[0]?.value === '[' && groups[2].at(-1)?.value === ']'
+      ? readArguments(groups[2], 1).groups : groups.slice(2);
+    const settings = new Map();
+    for (const option of options) {
+      if (option[0]?.type !== 'word' || option[1]?.value !== ':') continue;
+      const key = option[0].value;
+      settings.set(key, settings.has(key) ? null : option);
+    }
+    if (['url', 'socket', 'socket_dir'].some((key) => settings.has(key))) continue;
+    const host = settings.get('hostname')?.slice(2).map((part) => part.value).join('');
+    if (!['"localhost"', '"127.0.0.1"', '"::1"'].includes(host)) continue;
+    const adapter = settings.get('adapter')?.slice(2).map((part) => part.value).join('');
+    const username = settings.get('username')?.slice(2).map((part) => part.value).join('');
+    const postgres = settings.has('adapter') ? adapter === 'Ecto.Adapters.Postgres' : username === '"postgres"';
+    const password = settings.get('password');
+    if (postgres && password?.length === 3 && password[2].type === 'string') lines.add(password[0].line);
+  }
+  return lines;
+}
+
 function findSecrets(src, f, out) {
   const at = lineIndex(src);
   const isTest = TEST_FILE.test(f.path) || EXAMPLE_FILE.test(f.path);
@@ -273,6 +310,7 @@ function findSecrets(src, f, out) {
   // Assignments: api_key = "…", "password": "…", PASSWORD=… (config files may leave values unquoted).
   const lines = src.split('\n');
   const inDoc = docLines(src, f.lang);
+  const localPasswords = localPostgresPasswords(src, f);
   // CI / docker-compose database containers get throwaway passwords
   const throwawayDb = /(^|\/)\.github\/|(^|\/)(docker-)?compose[\w.-]*\.ya?ml$/i.test(f.path);
   const quoted = /(["']?)([A-Za-z_][\w.-]*)\1\s*(?::=|=>|=|:)\s*(?:[rbuRBU]{1,2})?(["'`])([^"'`\n]{6,200})\3/g;
@@ -288,7 +326,9 @@ function findSecrets(src, f, out) {
       if (!SECRET_NAME.test(n) || PUBLIC_NAME.test(n) || publicByDesign(value, n) || !valueLooksReal(value, n)) continue;
       if (trackerToken(name.split('.').pop(), value, src, f.path)) continue;
       if (throwawayDb && /^(postgres|mysql|mariadb|mongo(_initdb_root)?|redis|pg|rabbitmq_default|db|database)_(root_)?(password|pass|pwd)$/.test(n)) continue;
-      add(i + 1, { what: kindFromName(name), name: name.split('.').pop(), sev: 'high', hint: mask(value, PASSWORD_NAME.test(n)), generic: true });
+      const localPostgres = n === 'password' && localPasswords.has(i + 1);
+      const what = localPostgres ? `a local PostgreSQL ${localElixirEnvironment(f.path)} password` : kindFromName(name);
+      add(i + 1, { what, name: name.split('.').pop(), sev: 'high', hint: mask(value, PASSWORD_NAME.test(n)), generic: true, ...(localPostgres ? { localPostgres: true } : {}) });
     }
   });
 }
@@ -1429,11 +1469,29 @@ export function buildHealth({ graph, scan, arch, root }) {
     const n = locations.length;
     const sev = group.some((g) => g.list.some((s) => s.sev === 'high')) ? 'high' : 'medium';
     const one = group.length === 1 ? group[0].path : null;
+    const target = one ? one.split('/').pop() : `${group.length} more files`;
+    if (group.every((g) => g.list.every((s) => s.localPostgres))) {
+      const subject = one ? `${nameOf(one)} (${one})` : plural(group.length, 'file');
+      const environment = [...new Set(group.map((g) => localElixirEnvironment(g.path)))].join(' and ');
+      return {
+        id: 'secret:' + (one || group.map((g) => g.path).join('|')),
+        kind: 'secret', severity: sev,
+        title: n === 1 ? `A local PostgreSQL ${environment} password is written into ${target}` : `${n} local PostgreSQL ${environment} passwords are written into ${target}`,
+        detail: `${subject} configures a loopback PostgreSQL connection for ${environment} and stores ${n === 1 ? 'its password' : 'passwords'} in source. Anyone with access to the code can read ${n === 1 ? 'the value' : 'the values'}. Replace each literal with a local secret setting and rotate any matching password used in another environment.`,
+        items, notes, locations,
+        fix: [
+          'Move these local PostgreSQL passwords out of source. Keep their values out of replies, commits and logs.',
+          ...locations.map(({ file, line }) => `- ${file}:${line}`),
+          '',
+          'Use the project’s existing local secret setup or an Elixir environment lookup such as System.fetch_env!("LOCAL_DATABASE_PASSWORD"). Use a dedicated password for the local database and verify the connection still works. If the hard-coded value is reused on another database, rotate it there as well.',
+        ].join('\n'),
+      };
+    }
     const kindText = kinds.size === 1 ? [...kinds][0].replace(/ \(.*\)$/, '') : 'passwords or keys';
     return {
       id: 'secret:' + (one || group.map((g) => g.path).join('|')),
       kind: 'secret', severity: sev,
-      title: n === 1 ? `A secret key is written into ${one ? one.split('/').pop() : `${group.length} more files`}` : `${n} passwords or keys are written into ${one ? one.split('/').pop() : `${group.length} more files`}`,
+      title: n === 1 ? `A secret key is written into ${target}` : `${n} passwords or keys are written into ${target}`,
       detail: `${one ? `${nameOf(one)} (${one})` : plural(group.length, 'file')} contains ${n === 1 ? kindText : `${n} secrets (${kindText})`}. Anyone who can see the code can use ${n === 1 ? 'it' : 'them'} to get into ${svcs.size ? [...svcs].slice(0, 4).join(', ') : 'the services they unlock'} as you${frontend ? ', and this code is sent to every visitor’s browser' : ''}. Treat ${n === 1 ? 'it' : 'them'} as leaked: move ${n === 1 ? 'it' : 'them'} out of the code and replace ${n === 1 ? 'it with a new one' : 'them with new ones'}.`,
       items, notes, locations,
       fix: [

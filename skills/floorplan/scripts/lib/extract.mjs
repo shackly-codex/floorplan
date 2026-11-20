@@ -2,6 +2,7 @@
 // Deliberately approximate: good enough to draw the map, cheap enough to run on any repo.
 import { forwardIndexOf, importStatements, callArgs } from './common.mjs';
 import { dataRoutes } from './route-tables.mjs';
+import { extractElixir } from './elixir.mjs';
 
 import path from 'node:path';
 
@@ -2244,6 +2245,7 @@ function extractByLang(src, lang, filePath) {
     case 'swift': return extractSwift(src);
     case 'java': case 'kotlin': case 'scala': case 'groovy': return extractJvm(src);
     case 'csharp': return extractCSharp(src);
+    case 'elixir': return extractElixir(src);
     default: return extractSimple(src, lang);
   }
 }

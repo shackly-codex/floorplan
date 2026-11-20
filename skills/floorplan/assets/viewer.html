@@ -2464,7 +2464,7 @@ window.Floorplan = Object.freeze({
   info, chain, children: (id) => visibleKids(id), parentOf: (id) => parentOf.get(id), exists: (id) => Q.exists(id),
   files, nodes, routes, colorOf, iconKey,
   // html helpers
-  h, hk, revealHidden, icon, iconI, fmt, plural, md,
+  h, hk, revealHidden, icon, iconI, fmt, plural, md, editorUrl,
   // navigation
   go, reveal, select, open, up, fit, render: (o) => render({ keepTransform: true, ...o }), refreshPanel: () => renderPanel(),
   showBoard, playFlow, startFlow, stopFlow: () => { if (state.flow) stopFlow(); },
