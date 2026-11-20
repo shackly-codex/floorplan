@@ -3,7 +3,7 @@
 // runtime so none is ever committed to this repo.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { lib, FAKE_PASSWORD } from './helpers.mjs';
+import { cleanup, lib, makeProject, readGraph, scanAndBuild, FAKE_PASSWORD } from './helpers.mjs';
 
 const { findIssues } = await lib('health.mjs');
 const secrets = (src, path = 'app/config.py', lang = 'python') => findIssues(src, { path, category: 'code', lang }).filter((x) => x.k === 'secret');
@@ -16,6 +16,66 @@ test('a hard-coded password is found, with its line, and masked', () => {
   assert.equal(s.name, 'DB_PASSWORD');
   assert.equal(s.sev, 'high');
   assert.equal(s.hint, `${FAKE_PASSWORD.length} characters`, 'a password hint gives only its length');
+});
+
+const devRepo = (hostname, extra = '') => `import Config
+
+config :catalog, Catalog.Repo,
+  username: "postgres",
+  password: "${FAKE_PASSWORD}",
+  hostname: "${hostname}",
+  ${extra ? extra + ',\n  ' : ''}database: "catalog_dev"
+`;
+
+test('an identifiable loopback PostgreSQL Repo password gets local context', () => {
+  const dev = (src, file = 'catalog/config/dev.exs') => secrets(src, file, 'elixir');
+  const [local] = dev(devRepo('localhost'));
+  assert.deepEqual([local.what, local.sev, local.line, local.hint], [
+    'a local PostgreSQL development password', 'high', 5, `${FAKE_PASSWORD.length} characters`,
+  ]);
+  const [explicitAdapter] = dev(devRepo('::1', 'adapter: Ecto.Adapters.Postgres').replace('username: "postgres"', 'username: "catalog_user"'));
+  assert.equal(explicitAdapter.localPostgres, true);
+  const [testPassword] = dev(devRepo('127.0.0.1'), 'catalog/config/test.exs');
+  assert.deepEqual([testPassword.what, testPassword.sev, testPassword.line], ['a local PostgreSQL test password', 'high', 5]);
+
+  const cases = [
+    [devRepo('db.example.com') + '\n' + devRepo('localhost').replace(`password: "${FAKE_PASSWORD}",\n  `, ''), 'catalog/config/dev.exs'],
+    [devRepo('127.0.0.1', 'adapter: Ecto.Adapters.MyXQL'), 'catalog/config/dev.exs'],
+    [devRepo('127.0.0.1', 'url: database_url'), 'catalog/config/dev.exs'],
+    [devRepo('127.0.0.1'), 'catalog/config/runtime.exs'],
+  ];
+  for (const [source, file] of cases) {
+    const [password] = dev(source, file);
+    assert.deepEqual([password.what, password.sev, password.localPostgres], ['a password', 'high', undefined]);
+  }
+});
+
+test('Health explains local PostgreSQL development and test credentials', (t) => {
+  const root = makeProject({
+    'config/dev.exs': devRepo('localhost'),
+    'config/test.exs': devRepo('127.0.0.1'),
+    'config/runtime.exs': devRepo('db.example.com'),
+  }, { arch: {
+    project: { name: 'Catalog', summary: 'A sample Phoenix project.' },
+    nodes: [{ id: 'catalog', label: 'Catalog', kind: 'service', summary: 'Catalog server.', paths: ['config/**'] }],
+  } });
+  t.after(() => cleanup(root));
+
+  scanAndBuild(root);
+  const { health } = readGraph(root);
+  const local = health.issues.find((issue) => issue.id === 'secret:config/dev.exs');
+  const testIssue = health.issues.find((issue) => issue.id === 'secret:config/test.exs');
+  const remote = health.issues.find((issue) => issue.id === 'secret:config/runtime.exs');
+  assert.equal(local.title, 'A local PostgreSQL development password is written into dev.exs');
+  assert.equal(local.severity, 'high');
+  assert.deepEqual(local.locations, [{ file: 'config/dev.exs', line: 5 }]);
+  assert.match(local.detail, /loopback PostgreSQL connection for development/);
+  assert.match(local.fix, /Use a dedicated password for the local database/);
+  assert.equal(testIssue.title, 'A local PostgreSQL test password is written into test.exs');
+  assert.match(testIssue.detail, /loopback PostgreSQL connection for test/);
+  assert.equal(remote.title, 'A secret key is written into runtime.exs');
+  assert.equal(remote.severity, 'high');
+  assert.ok(!JSON.stringify(health).includes(FAKE_PASSWORD));
 });
 
 test('a known key format is named after its service and shows only its first characters', () => {

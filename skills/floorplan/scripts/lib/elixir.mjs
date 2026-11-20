@@ -96,7 +96,7 @@ export function tokenizeElixir(src) {
   return tokens;
 }
 
-function readArguments(tokens, at) {
+export function readArguments(tokens, at) {
   const parenthesized = tokens[at]?.value === '(';
   let i = at + (parenthesized ? 1 : 0);
   let start = i;
