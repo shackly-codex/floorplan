@@ -269,6 +269,27 @@ routesIn.forEach((r, i) => routeIdx.set(`${r.file}|${r.method}|${r.path}`, i));
 
 for (const e of scan.edges) if (includedSet.has(e.from) && includedSet.has(e.to)) addLink(`f:${e.from}`, `f:${e.to}`, 'import', { w: e.count || 1, names: e.names });
 for (const h of scan.http) if (includedSet.has(h.from) && includedSet.has(h.to)) addLink(`f:${h.from}`, `f:${h.to}`, 'http', { label: `${h.method} ${h.path}`, inferred: true, route: routeIdx.get(`${h.to}|${h.method}|${h.path}`), callLine: h.line });
+const elixirFlows = (scan.elixirFlows || []).filter(({ from, to }) => includedSet.has(from.file) && includedSet.has(to.file));
+const elixirLinkKinds = {
+  'liveview-event': 'event', 'elixir-call': 'call', 'ash-action': 'call', 'ash-policy-check': 'call',
+  'ash-publication': 'event', 'phoenix-pubsub': 'event', 'ecto-migration': 'data',
+};
+for (const { kind, from, to } of elixirFlows) {
+  if (from.file !== to.file && elixirLinkKinds[kind]) {
+    addLink(`f:${from.file}`, `f:${to.file}`, elixirLinkKinds[kind], { label: from.name + ' → ' + to.name, inferred: true });
+  }
+}
+const deployment = scan.deployment && {
+  nodes: scan.deployment.nodes.map((node) => ({
+    ...node, evidence: node.evidence.filter(({ file }) => !ignoreGlobs.some((g) => g.test(file))),
+  })).filter((node) => node.evidence.length),
+  edges: [],
+};
+if (deployment) {
+  const ids = new Set(deployment.nodes.map((node) => node.id));
+  deployment.edges = scan.deployment.edges.filter(({ from, to, evidence }) =>
+    ids.has(from) && ids.has(to) && !ignoreGlobs.some((g) => g.test(evidence.file)));
+}
 
 // externals: packages / hosts claimed by nodes
 const extIds = scan.externals.map((e) => e.id);
@@ -593,11 +614,19 @@ const graph = {
   }),
   routes: routesIn.map((r) => {
     const d = routeDesc.get(routeKey(r));
-    return { f: r.file, m: r.method, p: r.path, l: r.line, h: r.handler || null, name: d?.name || r.name || fallbackRouteName(r), d: d?.d || r.desc || r.doc || '', ...(d?.d || r.desc ? {} : { auto: true }), ...(d?.review ? { review: d.review } : {}), ...(r.doc ? { doc: r.doc } : {}), ...(r.access ? { access: r.access } : {}), ...(r.who ? { who: r.who } : {}), ...(r.publicBecause ? { publicBecause: r.publicBecause } : {}) };
+    const phoenix = r.framework === 'phoenix' ? {
+      phoenix: {
+        file: r.defFile, line: r.defLine, module: r.module, action: r.action, session: r.liveSession,
+        pipelines: r.pipelines, conditional: r.conditional, resolved: !!r.handlerResolved,
+      },
+    } : {};
+    return { f: r.file, m: r.method, p: r.path, l: r.line, h: r.handler || null, name: d?.name || r.name || fallbackRouteName(r), d: d?.d || r.desc || r.doc || '', ...(d?.d || r.desc ? {} : { auto: true }), ...(d?.review ? { review: d.review } : {}), ...(r.doc ? { doc: r.doc } : {}), ...(r.access ? { access: r.access } : {}), ...(r.who ? { who: r.who } : {}), ...(r.publicBecause ? { publicBecause: r.publicBecause } : {}), ...phoenix };
   }),
   links: [...links.values()],
   flows: outFlows,
   tour: outTour,
+  ...(elixirFlows.length ? { elixirFlows } : {}),
+  ...(deployment?.nodes.length ? { deployment } : {}),
   ...(outRecent?.items.length ? { recent: outRecent } : {}),
 };
 // extension hooks, computed from the finished graph plus the raw scan

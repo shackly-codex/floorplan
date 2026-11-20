@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { readJsonLoose, stripJsonComments, MAX_CONFIG_BYTES } from './common.mjs';
+import { elixirModuleResolver } from './elixir.mjs';
 
 const P = path.posix;
 
@@ -101,7 +102,7 @@ export function applyGlobalUsings(files) {
   }
 }
 
-export function createResolver(root, files) {
+export function createResolver(root, files, resolveElixir = elixirModuleResolver(files)) {
   const fileSet = new Set(files.map((f) => f.path));
   const byPath = new Map(files.map((f) => [f.path, f]));
   const dirsWith = (name) => files.filter((f) => P.basename(f.path) === name).map((f) => P.dirname(f.path));
@@ -615,6 +616,10 @@ export function createResolver(root, files) {
       case 'java': case 'kotlin': case 'scala': case 'groovy': return resolveJvm(file, imp);
       case 'swift': return resolveSwift(file, imp);
       case 'csharp': return resolveCs(file, imp);
+      case 'elixir': {
+        const resolved = resolveElixir(file, imp.spec);
+        return resolved ? { file: resolved.file.path } : {};
+      }
       case 'ruby': return resolveRelative(file.path, imp.spec, ['.rb']);
       case 'php': return resolvePhp(file.path, imp, file.repo);
       case 'liquid': return resolveLiquid(file.path, imp);

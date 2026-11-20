@@ -20,6 +20,9 @@ import { resolveRoutes, matchCalls, matchWayfinder, inertiaLinks } from './lib/r
 import { nuxtAutoImports } from './lib/nuxt.mjs';
 import { serverlessRoutes } from './lib/serverless.mjs';
 import { edgeFunctionRoutes } from './lib/supabase-functions.mjs';
+import { elixirModuleResolver } from './lib/elixir.mjs';
+import { extractElixirFlow, linkElixirFlows } from './lib/elixir-flow.mjs';
+import { scanDeployment } from './lib/deployment.mjs';
 
 const args = parseArgs(process.argv.slice(2));
 const unattended = unattendedMode(args);
@@ -93,7 +96,10 @@ for (const { path: p, repo } of fileList) {
     if (src.includes('\u0000')) { f.category = 'asset'; files.push(f); continue; }
     f.loc = src.split('\n').filter((l) => l.trim()).length;
     if (category === 'code' && src.length) {
-      try { Object.assign(f, extract(src, lang, p)); } catch (e) { f.extractError = String(e.message || e); }
+      try {
+        Object.assign(f, extract(src, lang, p));
+        if (lang === 'elixir' || lang === 'heex') f.elixirFlow = extractElixirFlow(src, f);
+      } catch (e) { f.extractError = String(e.message || e); }
       // h: exact content. sig: the parts a description depends on (exports, routes, docstring),
       // so edits inside function bodies don't mark a file's description as stale.
       f.h = hash(src);
@@ -128,7 +134,8 @@ function countLines(abs) {
 
 // ---------- 3. resolve imports ----------
 applyGlobalUsings(files);
-const resolve = createResolver(root, files);
+const resolveElixir = elixirModuleResolver(files);
+const resolve = createResolver(root, files, resolveElixir);
 const edges = [];
 const externals = new Map(); // `${eco}:${name}` -> { eco, name, count, files:Set }
 const extEdges = [];
@@ -181,7 +188,7 @@ if (wrappers.size) for (const f of files) {
 // ---------- 4. routes and HTTP calls ----------
 // plain PHP sites: each script under the document root is a page with its own address (needs the imports above)
 phpPages(files);
-const routes = resolveRoutes(files);
+const routes = resolveRoutes(files, resolveElixir);
 // Serverless Framework: endpoints declared in serverless.yml, placed in the file that answers them (lib/serverless.mjs)
 const serverless = serverlessRoutes(files, (p) => { try { return fs.readFileSync(path.join(root, p), 'utf8'); } catch { return ''; } });
 routes.push(...serverless.routes);
@@ -194,8 +201,20 @@ const inertia = inertiaLinks(files, routes);
 http.push(...wayfinderLinks, ...inertia.http);
 const fileAt = new Map(files.map((f) => [f.path, f]));
 for (const { file, hint } of inertia.hints) { const f = fileAt.get(file); if (f) f.screens = [...(f.screens || []), hint]; }
+for (const route of routes) if (route.live && route.handlerResolved) {
+  const f = fileAt.get(route.file);
+  f.screens = [...(f.screens || []), { fw: 'phoenix-liveview', url: route.path }];
+}
 const hosts = [];
 for (const f of files) for (const h of f.hosts || []) hosts.push({ from: f.path, host: h.host, line: h.line });
+const elixirFlows = linkElixirFlows(files, (file, name) => resolveElixir(file, name)?.file.path);
+const deployment = scanDeployment(files, (p) => {
+  const abs = path.join(root, p);
+  try {
+    const st = fs.lstatSync(abs);
+    return st.isFile() && st.size <= maxBytes ? fs.readFileSync(abs, 'utf8') : '';
+  } catch { return ''; }
+});
 
 // ---------- 5. write scan.json ----------
 // config files too big to be real ones (a tsconfig.json padded to megabytes) are noted, not read
@@ -223,6 +242,8 @@ const scan = {
   routes,
   http,
   hosts,
+  ...(elixirFlows.length ? { elixirFlows } : {}),
+  ...(deployment.nodes.length ? { deployment } : {}),
 };
 fs.mkdirSync(path.dirname(outFile), { recursive: true });
 fs.writeFileSync(outFile, JSON.stringify(scan));
@@ -329,6 +350,8 @@ for (const a of nuxt.apps) {
 }
 
 line(`HTTP  ${routes.length} route definitions, ${http.length} call->route matches (cross-file links not visible to imports)`);
+if (elixirFlows.length) line(`ELIXIR  ${elixirFlows.length} source-linked LiveView, Ash and Ecto relationships`);
+if (deployment.nodes.length) line(`DEPLOYMENT  ${deployment.nodes.length} components, ${deployment.edges.length} source-linked connections`);
 const httpDir = new Map();
 for (const h of http) {
   const k = `${dirOf(h.from, depthFor(h.from))} -> ${dirOf(h.to, depthFor(h.to))}`;
@@ -426,6 +449,8 @@ else {
       byLanguage: byLang,
       routes: routes.length,
       httpMatches: http.length,
+      ...(elixirFlows.length ? { elixirRelationships: elixirFlows.length } : {}),
+      ...(deployment.nodes.length ? { deploymentComponents: deployment.nodes.length, deploymentConnections: deployment.edges.length } : {}),
       importEdges: scan.edges.length,
       autoImportLinks: nuxt.edges.length,
       wayfinderLinks: wayfinderLinks.length,

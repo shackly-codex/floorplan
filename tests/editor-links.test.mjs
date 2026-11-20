@@ -94,7 +94,7 @@ test('architecture.json "editor" picks the editor by name or by link, for the bu
   assert.equal(pageLinks(page(root), g).editorUrl('shop-api/server.js', 3), `cursor://file/${rootPath(root)}/shop-api/server.js:3`);
   // the page builds every editor link through editorUrl, and escapes it in the button's href
   assert.doesNotMatch(page(root), /vscode:\/\/file\/\$\{/);
-  assert.equal((page(root).match(/href="\$\{hk\(url\)\}"/g) || []).length, 3);
+  assert.equal((page(root).match(/href="\$\{hk\(url\)\}"/g) || []).length, 5);
 
   const jb = built('idea://open?file={path}&line={line}');
   const links = pageLinks(page(jb), readGraph(jb));
